@@ -1,0 +1,477 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import mean_squared_error
+import warnings
+
+# ==========================================
+# 0. High-Performance Configuration
+# ==========================================
+st.set_page_config(
+    page_title="Supply Chain AI Cortex | Enterprise Edition",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    page_icon="📈"
+)
+warnings.filterwarnings('ignore')
+
+# Custom CSS for "Dark Mode" Professional Look
+st.markdown("""
+<style>
+    .stMetric {
+        background-color: #0E1117;
+        border: 1px solid #30333F;
+        padding: 15px;
+        border-radius: 5px;
+    }
+    .stProgress .st-bo {
+        background-color: #00AA00;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 1. Data Pipeline
+# ==========================================
+@st.cache_data
+def load_lean_data(filepath='m5_lean.csv'):
+    """Loads and caches the optimized dataset."""
+    try:
+        df = pd.read_csv(filepath)
+        
+        # --- FIX: ROBUST DATE RECONSTRUCTION ---
+        # The M5 dataset starts on 2011-01-29. 
+        # If 'date' is missing, we calculate it from 'd_num'.
+        if 'd_num' not in df.columns:
+            # Extract number from 'd_1', 'd_2', etc.
+            df['d_num'] = df['d'].apply(lambda x: int(x.split('_')[1]))
+
+        if 'date' not in df.columns:
+            start_date = pd.Timestamp("2011-01-29")
+            # date = Start + (d_num - 1) days
+            df['date'] = start_date + pd.to_timedelta(df['d_num'] - 1, unit='D')
+        else:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            
+        return df
+    except FileNotFoundError:
+        return None
+
+def create_features(df):
+    """
+    Rigorously regenerates temporal features for the recursive loop.
+    """
+    df = df.copy()
+    
+    # 1. Autoregressive Lags (The "Memory" of the model)
+    df['lag_1'] = df['sales'].shift(1)
+    df['lag_7'] = df['sales'].shift(7)
+    df['lag_14'] = df['sales'].shift(14)
+    df['lag_28'] = df['sales'].shift(28)
+    
+    # 2. Rolling Statistical Windows (The "Trend" of the model)
+    df['rolling_mean_7'] = df['sales'].shift(1).rolling(7).mean()
+    df['rolling_std_7'] = df['sales'].shift(1).rolling(7).std()
+    df['rolling_mean_28'] = df['sales'].shift(1).rolling(28).mean()
+    
+    # 3. Price Elasticity Signals
+    df['price_change'] = df['sell_price'].pct_change()
+    df['price_volatility'] = df['sell_price'].rolling(7).std()
+    
+    return df
+
+def prepare_training_data(df, item_id, store_id):
+    """Filters and encodes data for a specific time-series."""
+    data = df[(df['item_id'] == item_id) & (df['store_id'] == store_id)].copy()
+    
+    # Robust Label Encoding
+    le = LabelEncoder()
+    data['event_name_1'] = data['event_name_1'].astype(str).fillna('None')
+    data['event_name_1'] = le.fit_transform(data['event_name_1'])
+    data['event_name_1'] = data['event_name_1'].astype('category')
+    
+    # Apply Engineering
+    data = create_features(data)
+    
+    # Drop initial rows where lags are NaN
+    data = data.dropna(subset=['lag_28', 'rolling_mean_28'])
+    
+    return data
+
+# ==========================================
+# 2. Advanced Model Architecture
+# ==========================================
+def train_lightgbm(X_train, y_train, X_val, y_val):
+    params = {
+        'objective': 'tweedie', 
+        'tweedie_variance_power': 1.1,
+        'metric': 'rmse',
+        'learning_rate': 0.03, 
+        'num_leaves': 64,      
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.7,
+        'bagging_freq': 1,
+        'lambda_l1': 0.1,      
+        'lambda_l2': 0.1,      
+        'n_jobs': -1,
+        'verbosity': -1
+    }
+    train_set = lgb.Dataset(X_train, label=y_train)
+    val_set = lgb.Dataset(X_val, label=y_val, reference=train_set)
+    
+    model = lgb.train(
+        params, train_set, num_boost_round=1500,
+        valid_sets=[train_set, val_set],
+        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
+    )
+    return model
+
+def train_xgboost(X_train, y_train, X_val, y_val):
+    dtrain = xgb.DMatrix(X_train, label=y_train, enable_categorical=True)
+    dval = xgb.DMatrix(X_val, label=y_val, enable_categorical=True)
+    
+    params = {
+        'objective': 'reg:tweedie',
+        'tweedie_variance_power': 1.1,
+        'eval_metric': 'rmse',
+        'eta': 0.03,
+        'max_depth': 8,       
+        'subsample': 0.7,
+        'colsample_bytree': 0.7,
+        'alpha': 0.1,         
+        'lambda': 0.1,        
+        'nthread': -1,
+        'verbosity': 0
+    }
+    
+    model = xgb.train(
+        params, dtrain, num_boost_round=1500,
+        evals=[(dtrain, 'train'), (dval, 'eval')],
+        early_stopping_rounds=100,
+        verbose_eval=False
+    )
+    return model
+
+# ==========================================
+# 3. Recursive Simulation Engine
+# ==========================================
+def recursive_predict(model, df, start_day, model_type):
+    """
+    Simulates the future day-by-day.
+    Crucial: Sales predicted for T+1 become inputs for T+2.
+    """
+    # Define features to include (exclude metadata)
+    exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
+                    'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
+                    'snap_CA', 'snap_TX', 'snap_WI']
+    
+    features = [c for c in df.columns if c not in exclude_cols]
+    future_horizon = 28
+    
+    # Progress visualization
+    progress_text = "Running Recursive Stochastic Simulation..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    for i, day in enumerate(range(start_day, start_day + future_horizon)):
+        # 1. Update Lags/Rolling features based on previous day's (predicted) data
+        df = create_features(df)
+        
+        # 2. Identify the target row
+        mask = df['d_num'] == day
+        X_test = df[mask][features]
+        
+        if X_test.empty:
+            break
+            
+        # 3. Inference
+        if model_type == 'LightGBM':
+            pred = model.predict(X_test)[0]
+        else: # XGBoost
+            dtest = xgb.DMatrix(X_test, enable_categorical=True)
+            pred = model.predict(dtest)[0]
+        
+        # 4. Update the "Sales" column (Reality Simulation)
+        pred = max(0, pred) 
+        df.loc[mask, 'sales'] = pred
+        
+        my_bar.progress((i + 1) / future_horizon, text=f"Simulating Day {day}...")
+        
+    my_bar.empty()
+    return df, features
+
+def calculate_inventory_plan(df, start_day, rmse, lead_time, service_level_z, initial_stock):
+    """
+    Advanced Inventory Logic
+    """
+    plan = df[df['d_num'] >= start_day].copy()
+    
+    # Calculate Safety Stock using RMSE
+    plan['safety_stock'] = service_level_z * rmse * np.sqrt(lead_time)
+    
+    inventory_levels = []
+    order_quantities = []
+    stock = initial_stock
+    
+    for _, row in plan.iterrows():
+        # Morning Check
+        reorder_point = row['safety_stock'] + (row['sales'] * lead_time)
+        
+        order_qty = 0
+        if stock < reorder_point:
+            # Order to cover Lead Time + 7 Days Demand + Safety Stock
+            target_level = reorder_point + (row['sales'] * 7)
+            order_qty = target_level - stock
+            stock += order_qty 
+            
+        # Evening Demand
+        stock -= row['sales']
+        
+        inventory_levels.append(max(0, stock))
+        order_quantities.append(max(0, order_qty))
+        
+    plan['projected_inventory'] = inventory_levels
+    plan['recommended_order'] = order_quantities
+    
+    return plan
+
+# ==========================================
+# 4. Interactive Visualization (Plotly)
+# ==========================================
+def plot_interactive_lifecycle(history, forecast, item, rmse):
+    # Filter history for better visibility (last 120 days)
+    history_view = history[history['d_num'] > (1913 - 120)]
+    
+    fig = go.Figure()
+    
+    # Use 'date' for X-axis if available, else 'd_num'
+    x_hist = history_view['date'] if 'date' in history_view.columns else history_view['d_num']
+    x_fore = forecast['date'] if 'date' in forecast.columns else forecast['d_num']
+    
+    # 1. Historical Data
+    fig.add_trace(go.Scatter(
+        x=x_hist, y=history_view['sales'],
+        mode='lines', name='Historical Sales',
+        line=dict(color='gray', width=1.5), opacity=0.6
+    ))
+    
+    # 2. Forecast Data
+    fig.add_trace(go.Scatter(
+        x=x_fore, y=forecast['sales'],
+        mode='lines+markers', name='AI Forecast',
+        line=dict(color='#00CC96', width=3),
+        marker=dict(size=5)
+    ))
+    
+    # 3. Confidence Interval
+    upper_bound = forecast['sales'] + (1.96 * rmse)
+    lower_bound = forecast['sales'] - (1.96 * rmse)
+    lower_bound = lower_bound.apply(lambda x: max(0, x))
+    
+    fig.add_trace(go.Scatter(
+        x=pd.concat([x_fore, x_fore[::-1]]),
+        y=pd.concat([upper_bound, lower_bound[::-1]]),
+        fill='toself',
+        fillcolor='rgba(0, 204, 150, 0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        hoverinfo="skip",
+        name='95% Confidence Interval'
+    ))
+    
+    fig.update_layout(
+        title=f"<b>Deep Learning Trajectory: {item}</b>",
+        xaxis_title="Date / Time Steps",
+        yaxis_title="Sales Volume",
+        template="plotly_white",
+        hovermode="x unified",
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+    )
+    
+    return fig
+
+def plot_interactive_action_plan(plan, item):
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    x_axis = plan['date'] if 'date' in plan.columns else plan['d_num']
+    
+    # 1. Demand Line
+    fig.add_trace(
+        go.Scatter(x=x_axis, y=plan['sales'], name="Predicted Demand",
+                   line=dict(color='#636EFA', width=3)),
+        secondary_y=False
+    )
+    
+    # 2. Inventory Level
+    fig.add_trace(
+        go.Scatter(x=x_axis, y=plan['projected_inventory'], name="Projected Inventory",
+                   line=dict(width=0), fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.1)'),
+        secondary_y=False
+    )
+    
+    # 3. Orders
+    orders = plan[plan['recommended_order'] > 0.01]
+    if not orders.empty:
+        x_orders = orders['date'] if 'date' in orders.columns else orders['d_num']
+        fig.add_trace(
+            go.Bar(x=x_orders, y=orders['recommended_order'], name="Recommended Order",
+                   marker_color='#EF553B', opacity=0.8),
+            secondary_y=True
+        )
+    
+    fig.update_layout(
+        title=f"<b>Supply Chain Action Plan: {item}</b>",
+        template="plotly_white",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    fig.update_yaxes(title_text="Units (Demand/Stock)", secondary_y=False)
+    fig.update_yaxes(title_text="Units (Replenishment)", secondary_y=True, showgrid=False)
+    
+    return fig
+
+def plot_feature_importance(model, features, model_type):
+    if model_type == 'LightGBM':
+        importance = model.feature_importance(importance_type='gain')
+    else:
+        importance_map = model.get_score(importance_type='gain')
+        importance = [importance_map.get(f, 0) for f in features]
+        
+    fi_df = pd.DataFrame({'Feature': features, 'Importance': importance})
+    fi_df = fi_df.sort_values(by='Importance', ascending=True).tail(15)
+    
+    fig = px.bar(fi_df, x='Importance', y='Feature', orientation='h',
+                 title='<b>Model Explainability: Top Drivers</b>',
+                 color='Importance', color_continuous_scale='Viridis')
+    fig.update_layout(template="plotly_white")
+    return fig
+
+# ==========================================
+# 5. Main Application Logic
+# ==========================================
+def main():
+    st.title("🧠 Supply Chain AI Cortex")
+    st.markdown("### Next-Gen Stochastic Forecasting & Replenishment System")
+    
+    data = load_lean_data()
+    if data is None:
+        st.error("⚠️ System Offline: `m5_lean.csv` not detected. Please execute the data engineering pipeline.")
+        return
+
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        st.subheader("Target Selection")
+        selected_store = st.selectbox("Store Location", data['store_id'].unique())
+        selected_item = st.selectbox("Product SKU", data['item_id'].unique())
+        
+        st.subheader("Model Hyperparameters")
+        selected_model = st.radio("AI Architecture", ["LightGBM", "XGBoost"], index=0)
+        
+        st.markdown("---")
+        st.subheader("Inventory Simulation Parameters")
+        lead_time = st.slider("Supplier Lead Time (Days)", 1, 14, 3)
+        service_level = st.slider("Target Service Level (%)", 80, 99, 95)
+        current_stock = st.number_input("Current Stock On-Hand", min_value=0, value=50)
+        
+        z_score_map = {99: 2.33, 95: 1.64, 90: 1.28, 85: 1.04, 80: 0.84}
+        z_score = z_score_map.get(service_level, 1.64)
+
+    # --- Main Block ---
+    if st.button("🚀 Run AI Analysis", type="primary"):
+        
+        with st.status("Initializing AI Cortex...", expanded=True) as status:
+            st.write("🔧 Engineering temporal features (Lags, Rolling Windows)...")
+            grid = prepare_training_data(data, selected_item, selected_store)
+            
+            # Split
+            SPLIT_DAY = 1913
+            exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
+                            'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
+                            'snap_CA', 'snap_TX', 'snap_WI']
+            features = [c for c in grid.columns if c not in exclude_cols]
+            
+            train_mask = grid['d_num'] <= SPLIT_DAY - 28
+            val_mask = (grid['d_num'] > SPLIT_DAY - 28) & (grid['d_num'] <= SPLIT_DAY)
+            
+            X_train = grid[train_mask][features]
+            y_train = grid[train_mask]['sales']
+            X_val = grid[val_mask][features]
+            y_val = grid[val_mask]['sales']
+            
+            # Train
+            st.write(f"🧠 Training {selected_model} (Tweedie Loss Optimization)...")
+            if selected_model == "LightGBM":
+                model = train_lightgbm(X_train, y_train, X_val, y_val)
+                val_preds = model.predict(X_val)
+            else:
+                model = train_xgboost(X_train, y_train, X_val, y_val)
+                dval = xgb.DMatrix(X_val, enable_categorical=True)
+                val_preds = model.predict(dval)
+            
+            rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+            st.write("🔮 Generating Recursive Forecast (28 Days Horizon)...")
+            
+            # Forecast
+            forecast_grid, final_features = recursive_predict(model, grid.copy(), 1914, selected_model)
+            
+            status.update(label="Analysis Complete!", state="complete", expanded=False)
+
+        # --- Dashboard ---
+        st.markdown("### 📊 Executive Summary")
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        
+        plan = calculate_inventory_plan(forecast_grid, 1914, rmse, lead_time, z_score, current_stock)
+        total_demand = plan['sales'].sum()
+        next_order = plan[plan['recommended_order'] > 0]
+        
+        # Determine next order date or day number
+        if not next_order.empty:
+            if 'date' in next_order.columns:
+                next_order_day = next_order['date'].dt.strftime('%Y-%m-%d').iloc[0]
+            else:
+                next_order_day = f"Day {next_order['d_num'].iloc[0]}"
+        else:
+            next_order_day = "None"
+        
+        kpi1.metric("Model Confidence (RMSE)", f"{rmse:.2f}", delta_color="inverse")
+        kpi2.metric("28-Day Demand Forecast", f"{int(total_demand)} units")
+        kpi3.metric("Safety Stock Buffer", f"{int(plan['safety_stock'].mean())} units")
+        kpi4.metric("Next Replenishment", next_order_day)
+
+        # --- Tabs ---
+        tab1, tab2, tab3 = st.tabs(["📈 Lifecycle & Forecast", "🚚 Inventory Action Plan", "🔍 Model Diagnostics"])
+        
+        with tab1:
+            st.plotly_chart(plot_interactive_lifecycle(grid, plan, selected_item, rmse), use_container_width=True)
+            
+        with tab2:
+            st.plotly_chart(plot_interactive_action_plan(plan, selected_item), use_container_width=True)
+            st.markdown("#### 📋 Detailed Replenishment Schedule")
+            
+            # Clean up display dataframe
+            cols_to_show = ['sales', 'safety_stock', 'projected_inventory', 'recommended_order']
+            if 'date' in plan.columns:
+                display_df = plan[['date'] + cols_to_show].head(14)
+                display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+            else:
+                display_df = plan[['d_num'] + cols_to_show].head(14)
+
+            st.dataframe(
+                display_df.style.background_gradient(cmap='Reds', subset=['recommended_order'])
+                                .format({c: "{:.1f}" for c in cols_to_show}),
+                use_container_width=True
+            )
+            
+        with tab3:
+            st.plotly_chart(plot_feature_importance(model, features, selected_model), use_container_width=True)
+            st.info("Feature Importance shows which variables (Lags, Trends, Price) most influenced the AI's decision.")
+
+if __name__ == "__main__":
+    main()
