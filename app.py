@@ -8,7 +8,9 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import mean_squared_error
+from prophet import Prophet 
 import warnings
+import logging
 
 # ==========================================
 # 0. High-Performance Configuration
@@ -20,6 +22,10 @@ st.set_page_config(
     page_icon="📈"
 )
 warnings.filterwarnings('ignore')
+
+# Suppress Prophet's verbose logging
+logging.getLogger('prophet').setLevel(logging.ERROR)
+logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
 
 # Custom CSS for "Dark Mode" Professional Look
 st.markdown("""
@@ -46,15 +52,11 @@ def load_lean_data(filepath='m5_lean.csv'):
         df = pd.read_csv(filepath)
         
         # --- FIX: ROBUST DATE RECONSTRUCTION ---
-        # The M5 dataset starts on 2011-01-29. 
-        # If 'date' is missing, we calculate it from 'd_num'.
         if 'd_num' not in df.columns:
-            # Extract number from 'd_1', 'd_2', etc.
             df['d_num'] = df['d'].apply(lambda x: int(x.split('_')[1]))
 
         if 'date' not in df.columns:
             start_date = pd.Timestamp("2011-01-29")
-            # date = Start + (d_num - 1) days
             df['date'] = start_date + pd.to_timedelta(df['d_num'] - 1, unit='D')
         else:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -65,17 +67,17 @@ def load_lean_data(filepath='m5_lean.csv'):
 
 def create_features(df):
     """
-    Rigorously regenerates temporal features for the recursive loop.
+    Rigorously regenerates temporal features for Tree Models (LGBM/XGB).
     """
     df = df.copy()
     
-    # 1. Autoregressive Lags (The "Memory" of the model)
+    # 1. Autoregressive Lags
     df['lag_1'] = df['sales'].shift(1)
     df['lag_7'] = df['sales'].shift(7)
     df['lag_14'] = df['sales'].shift(14)
     df['lag_28'] = df['sales'].shift(28)
     
-    # 2. Rolling Statistical Windows (The "Trend" of the model)
+    # 2. Rolling Statistical Windows
     df['rolling_mean_7'] = df['sales'].shift(1).rolling(7).mean()
     df['rolling_std_7'] = df['sales'].shift(1).rolling(7).std()
     df['rolling_mean_28'] = df['sales'].shift(1).rolling(28).mean()
@@ -94,13 +96,8 @@ def prepare_training_data(df, item_id, store_id):
     le = LabelEncoder()
     data['event_name_1'] = data['event_name_1'].astype(str).fillna('None')
     data['event_name_1'] = le.fit_transform(data['event_name_1'])
-    data['event_name_1'] = data['event_name_1'].astype('category')
-    
-    # Apply Engineering
-    data = create_features(data)
-    
-    # Drop initial rows where lags are NaN
-    data = data.dropna(subset=['lag_28', 'rolling_mean_28'])
+    # Convert to numeric for models
+    data['event_name_1'] = data['event_name_1'].astype(int) 
     
     return data
 
@@ -113,12 +110,12 @@ def train_lightgbm(X_train, y_train, X_val, y_val):
         'tweedie_variance_power': 1.1,
         'metric': 'rmse',
         'learning_rate': 0.03, 
-        'num_leaves': 64,      
+        'num_leaves': 64,       
         'feature_fraction': 0.8,
         'bagging_fraction': 0.7,
         'bagging_freq': 1,
-        'lambda_l1': 0.1,      
-        'lambda_l2': 0.1,      
+        'lambda_l1': 0.1,       
+        'lambda_l2': 0.1,       
         'n_jobs': -1,
         'verbosity': -1
     }
@@ -133,6 +130,10 @@ def train_lightgbm(X_train, y_train, X_val, y_val):
     return model
 
 def train_xgboost(X_train, y_train, X_val, y_val):
+    # Ensure y is float and clean (Redundant check but safe)
+    y_train = y_train.astype(float)
+    y_val = y_val.astype(float)
+
     dtrain = xgb.DMatrix(X_train, label=y_train, enable_categorical=True)
     dval = xgb.DMatrix(X_val, label=y_val, enable_categorical=True)
     
@@ -141,11 +142,11 @@ def train_xgboost(X_train, y_train, X_val, y_val):
         'tweedie_variance_power': 1.1,
         'eval_metric': 'rmse',
         'eta': 0.03,
-        'max_depth': 8,       
+        'max_depth': 8,        
         'subsample': 0.7,
         'colsample_bytree': 0.7,
-        'alpha': 0.1,         
-        'lambda': 0.1,        
+        'alpha': 0.1,          
+        'lambda': 0.1,         
         'nthread': -1,
         'verbosity': 0
     }
@@ -158,15 +159,39 @@ def train_xgboost(X_train, y_train, X_val, y_val):
     )
     return model
 
+def train_prophet_model(df_train):
+    """
+    Trains Prophet.
+    Requires columns: date -> ds, sales -> y, regressors.
+    """
+    # Prepare DataFrame for Prophet
+    prophet_df = df_train[['date', 'sales', 'sell_price']].copy()
+    prophet_df.columns = ['ds', 'y', 'sell_price']
+    
+    # Configure Prophet
+    model = Prophet(
+        growth='linear',
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=True,
+        seasonality_mode='multiplicative',
+        interval_width=0.95
+    )
+    model.add_regressor('sell_price')
+    
+    model.fit(prophet_df)
+    return model
+
 # ==========================================
-# 3. Recursive Simulation Engine
+# 3. Simulation Engines (Recursive & Batch)
 # ==========================================
 def recursive_predict(model, df, start_day, model_type):
     """
-    Simulates the future day-by-day.
-    Crucial: Sales predicted for T+1 become inputs for T+2.
+    Recursive Engine for Tree Models (LGBM, XGB).
     """
-    # Define features to include (exclude metadata)
+    # Create features ONLY for tree models
+    df = create_features(df)
+    
     exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
                     'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
                     'snap_CA', 'snap_TX', 'snap_WI']
@@ -174,29 +199,26 @@ def recursive_predict(model, df, start_day, model_type):
     features = [c for c in df.columns if c not in exclude_cols]
     future_horizon = 28
     
-    # Progress visualization
     progress_text = "Running Recursive Stochastic Simulation..."
     my_bar = st.progress(0, text=progress_text)
     
     for i, day in enumerate(range(start_day, start_day + future_horizon)):
-        # 1. Update Lags/Rolling features based on previous day's (predicted) data
+        # 1. Update features based on previous day's predictions
         df = create_features(df)
         
-        # 2. Identify the target row
         mask = df['d_num'] == day
         X_test = df[mask][features]
         
-        if X_test.empty:
-            break
+        if X_test.empty: break
             
-        # 3. Inference
+        # 2. Inference
         if model_type == 'LightGBM':
             pred = model.predict(X_test)[0]
         else: # XGBoost
             dtest = xgb.DMatrix(X_test, enable_categorical=True)
             pred = model.predict(dtest)[0]
         
-        # 4. Update the "Sales" column (Reality Simulation)
+        # 3. Update Sales for recursion
         pred = max(0, pred) 
         df.loc[mask, 'sales'] = pred
         
@@ -204,6 +226,24 @@ def recursive_predict(model, df, start_day, model_type):
         
     my_bar.empty()
     return df, features
+
+def batch_predict_prophet(model, grid, start_day):
+    """
+    Batch Engine for Prophet.
+    """
+    # Filter for future range
+    future_mask = grid['d_num'] >= start_day
+    future_df = grid[future_mask][['date', 'sell_price']].copy()
+    future_df.columns = ['ds', 'sell_price']
+    
+    # Predict
+    forecast = model.predict(future_df)
+    
+    # Map back to grid
+    grid.loc[future_mask, 'sales'] = forecast['yhat'].values
+    
+    # Return grid and dummy features list (Prophet doesn't use feature lists like Trees)
+    return grid, ['sell_price', 'trend', 'weekly', 'yearly']
 
 def calculate_inventory_plan(df, start_day, rmse, lead_time, service_level_z, initial_stock):
     """
@@ -244,23 +284,21 @@ def calculate_inventory_plan(df, start_day, rmse, lead_time, service_level_z, in
 # 4. Interactive Visualization (Plotly)
 # ==========================================
 def plot_interactive_lifecycle(history, forecast, item, rmse):
-    # Filter history for better visibility (last 120 days)
     history_view = history[history['d_num'] > (1913 - 120)]
     
     fig = go.Figure()
     
-    # Use 'date' for X-axis if available, else 'd_num'
     x_hist = history_view['date'] if 'date' in history_view.columns else history_view['d_num']
     x_fore = forecast['date'] if 'date' in forecast.columns else forecast['d_num']
     
-    # 1. Historical Data
+    # Historical
     fig.add_trace(go.Scatter(
         x=x_hist, y=history_view['sales'],
         mode='lines', name='Historical Sales',
         line=dict(color='gray', width=1.5), opacity=0.6
     ))
     
-    # 2. Forecast Data
+    # Forecast
     fig.add_trace(go.Scatter(
         x=x_fore, y=forecast['sales'],
         mode='lines+markers', name='AI Forecast',
@@ -268,7 +306,7 @@ def plot_interactive_lifecycle(history, forecast, item, rmse):
         marker=dict(size=5)
     ))
     
-    # 3. Confidence Interval
+    # Confidence Interval
     upper_bound = forecast['sales'] + (1.96 * rmse)
     lower_bound = forecast['sales'] - (1.96 * rmse)
     lower_bound = lower_bound.apply(lambda x: max(0, x))
@@ -285,13 +323,12 @@ def plot_interactive_lifecycle(history, forecast, item, rmse):
     
     fig.update_layout(
         title=f"<b>Deep Learning Trajectory: {item}</b>",
-        xaxis_title="Date / Time Steps",
+        xaxis_title="Date",
         yaxis_title="Sales Volume",
         template="plotly_white",
         hovermode="x unified",
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
     )
-    
     return fig
 
 def plot_interactive_action_plan(plan, item):
@@ -299,21 +336,18 @@ def plot_interactive_action_plan(plan, item):
     
     x_axis = plan['date'] if 'date' in plan.columns else plan['d_num']
     
-    # 1. Demand Line
     fig.add_trace(
         go.Scatter(x=x_axis, y=plan['sales'], name="Predicted Demand",
                    line=dict(color='#636EFA', width=3)),
         secondary_y=False
     )
     
-    # 2. Inventory Level
     fig.add_trace(
         go.Scatter(x=x_axis, y=plan['projected_inventory'], name="Projected Inventory",
                    line=dict(width=0), fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.1)'),
         secondary_y=False
     )
     
-    # 3. Orders
     orders = plan[plan['recommended_order'] > 0.01]
     if not orders.empty:
         x_orders = orders['date'] if 'date' in orders.columns else orders['d_num']
@@ -332,13 +366,15 @@ def plot_interactive_action_plan(plan, item):
     
     fig.update_yaxes(title_text="Units (Demand/Stock)", secondary_y=False)
     fig.update_yaxes(title_text="Units (Replenishment)", secondary_y=True, showgrid=False)
-    
     return fig
 
 def plot_feature_importance(model, features, model_type):
+    if model_type == 'Prophet':
+        return None
+        
     if model_type == 'LightGBM':
         importance = model.feature_importance(importance_type='gain')
-    else:
+    else: # XGBoost
         importance_map = model.get_score(importance_type='gain')
         importance = [importance_map.get(f, 0) for f in features]
         
@@ -372,7 +408,7 @@ def main():
         selected_item = st.selectbox("Product SKU", data['item_id'].unique())
         
         st.subheader("Model Hyperparameters")
-        selected_model = st.radio("AI Architecture", ["LightGBM", "XGBoost"], index=0)
+        selected_model = st.radio("AI Architecture", ["LightGBM", "XGBoost", "Prophet"], index=0)
         
         st.markdown("---")
         st.subheader("Inventory Simulation Parameters")
@@ -387,39 +423,76 @@ def main():
     if st.button("🚀 Run AI Analysis", type="primary"):
         
         with st.status("Initializing AI Cortex...", expanded=True) as status:
-            st.write("🔧 Engineering temporal features (Lags, Rolling Windows)...")
+            st.write("🔧 Preparing Data Grid...")
             grid = prepare_training_data(data, selected_item, selected_store)
             
-            # Split
             SPLIT_DAY = 1913
-            exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
-                            'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
-                            'snap_CA', 'snap_TX', 'snap_WI']
-            features = [c for c in grid.columns if c not in exclude_cols]
             
-            train_mask = grid['d_num'] <= SPLIT_DAY - 28
-            val_mask = (grid['d_num'] > SPLIT_DAY - 28) & (grid['d_num'] <= SPLIT_DAY)
-            
-            X_train = grid[train_mask][features]
-            y_train = grid[train_mask]['sales']
-            X_val = grid[val_mask][features]
-            y_val = grid[val_mask]['sales']
-            
-            # Train
-            st.write(f"🧠 Training {selected_model} (Tweedie Loss Optimization)...")
-            if selected_model == "LightGBM":
-                model = train_lightgbm(X_train, y_train, X_val, y_val)
-                val_preds = model.predict(X_val)
+            # --- BRANCHING LOGIC FOR MODELS ---
+            if selected_model == "Prophet":
+                st.write(f"🧠 Training {selected_model} (Bayesian Time Series)...")
+                
+                # Prophet trains on history only
+                train_mask = grid['d_num'] <= SPLIT_DAY
+                train_data = grid[train_mask]
+                
+                # Train
+                model = train_prophet_model(train_data)
+                
+                # Validate
+                val_mask = (grid['d_num'] > SPLIT_DAY - 28) & (grid['d_num'] <= SPLIT_DAY)
+                val_data = grid[val_mask][['date', 'sell_price']].copy()
+                val_data.columns = ['ds', 'sell_price']
+                val_preds = model.predict(val_data)['yhat'].values
+                y_val = grid[val_mask]['sales'].values
+                
+                rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+                
+                # Forecast
+                st.write("🔮 Generating Batch Forecast (28 Days Horizon)...")
+                forecast_grid, final_features = batch_predict_prophet(model, grid.copy(), 1914)
+
             else:
-                model = train_xgboost(X_train, y_train, X_val, y_val)
-                dval = xgb.DMatrix(X_val, enable_categorical=True)
-                val_preds = model.predict(dval)
-            
-            rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-            st.write("🔮 Generating Recursive Forecast (28 Days Horizon)...")
-            
-            # Forecast
-            forecast_grid, final_features = recursive_predict(model, grid.copy(), 1914, selected_model)
+                # Tree Models (LightGBM / XGBoost)
+                st.write("🔧 Engineering temporal features (Lags, Rolling Windows)...")
+                
+                # Create features 
+                grid_feat = create_features(grid)
+                
+                # FIX 1: Drop rows where lags are calculated (first 28 days usually become NaN)
+                grid_feat = grid_feat.dropna(subset=['lag_28', 'rolling_mean_28'])
+                
+                # FIX 2: XGBoost FATAL ERROR FIX
+                # We must ensure the 'sales' (target) column has NO NaNs for training
+                grid_feat = grid_feat.dropna(subset=['sales'])
+
+                exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
+                                'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
+                                'snap_CA', 'snap_TX', 'snap_WI']
+                features = [c for c in grid_feat.columns if c not in exclude_cols]
+                
+                train_mask = grid_feat['d_num'] <= SPLIT_DAY - 28
+                val_mask = (grid_feat['d_num'] > SPLIT_DAY - 28) & (grid_feat['d_num'] <= SPLIT_DAY)
+                
+                X_train = grid_feat[train_mask][features]
+                y_train = grid_feat[train_mask]['sales']
+                X_val = grid_feat[val_mask][features]
+                y_val = grid_feat[val_mask]['sales']
+                
+                st.write(f"🧠 Training {selected_model} (Tweedie Loss Optimization)...")
+                if selected_model == "LightGBM":
+                    model = train_lightgbm(X_train, y_train, X_val, y_val)
+                    val_preds = model.predict(X_val)
+                else:
+                    model = train_xgboost(X_train, y_train, X_val, y_val)
+                    dval = xgb.DMatrix(X_val, enable_categorical=True)
+                    val_preds = model.predict(dval)
+                
+                rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+                
+                st.write("🔮 Generating Recursive Forecast (28 Days Horizon)...")
+                # Pass the original 'grid' (raw data) to recursive engine
+                forecast_grid, final_features = recursive_predict(model, grid.copy(), 1914, selected_model)
             
             status.update(label="Analysis Complete!", state="complete", expanded=False)
 
@@ -431,7 +504,6 @@ def main():
         total_demand = plan['sales'].sum()
         next_order = plan[plan['recommended_order'] > 0]
         
-        # Determine next order date or day number
         if not next_order.empty:
             if 'date' in next_order.columns:
                 next_order_day = next_order['date'].dt.strftime('%Y-%m-%d').iloc[0]
@@ -455,7 +527,6 @@ def main():
             st.plotly_chart(plot_interactive_action_plan(plan, selected_item), use_container_width=True)
             st.markdown("#### 📋 Detailed Replenishment Schedule")
             
-            # Clean up display dataframe
             cols_to_show = ['sales', 'safety_stock', 'projected_inventory', 'recommended_order']
             if 'date' in plan.columns:
                 display_df = plan[['date'] + cols_to_show].head(14)
@@ -470,8 +541,12 @@ def main():
             )
             
         with tab3:
-            st.plotly_chart(plot_feature_importance(model, features, selected_model), use_container_width=True)
-            st.info("Feature Importance shows which variables (Lags, Trends, Price) most influenced the AI's decision.")
+            if selected_model == "Prophet":
+                st.info("Prophet operates on Bayesian curve fitting (Trend + Seasonality). Feature Importance is not applicable like Tree models.")
+                st.markdown("**Prophet Components:** The model relies heavily on the `sell_price` regressor and weekly seasonality patterns found in this dataset.")
+            else:
+                st.plotly_chart(plot_feature_importance(model, final_features, selected_model), use_container_width=True)
+                st.info("Feature Importance shows which variables (Lags, Trends, Price) most influenced the AI's decision.")
 
 if __name__ == "__main__":
     main()
