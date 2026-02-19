@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import xgboost as xgb
+from catboost import CatBoostRegressor, Pool
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -67,7 +68,7 @@ def load_lean_data(filepath='m5_lean.csv'):
 
 def create_features(df):
     """
-    Rigorously regenerates temporal features for Tree Models (LGBM/XGB).
+    Rigorously regenerates temporal features for Tree Models (LGBM/XGB/CatBoost).
     """
     df = df.copy()
     
@@ -130,7 +131,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val):
     return model
 
 def train_xgboost(X_train, y_train, X_val, y_val):
-    # Ensure y is float and clean (Redundant check but safe)
+    # Ensure y is float and clean
     y_train = y_train.astype(float)
     y_val = y_val.astype(float)
 
@@ -159,16 +160,35 @@ def train_xgboost(X_train, y_train, X_val, y_val):
     )
     return model
 
+def train_catboost(X_train, y_train, X_val, y_val, features):
+    # Identify categorical features dynamically
+    cat_cols = ['event_name_1', 'snap_CA', 'snap_TX', 'snap_WI']
+    cat_indices = [features.index(c) for c in cat_cols if c in features]
+
+    train_pool = Pool(X_train, y_train, cat_features=cat_indices)
+    val_pool = Pool(X_val, y_val, cat_features=cat_indices)
+
+    model = CatBoostRegressor(
+        iterations=1500,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=3,
+        loss_function='Tweedie:variance_power=1.1',
+        eval_metric='RMSE',
+        random_seed=42,
+        early_stopping_rounds=100,
+        verbose=0,
+        allow_writing_files=False
+    )
+    
+    model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+    return model
+
 def train_prophet_model(df_train):
-    """
-    Trains Prophet.
-    Requires columns: date -> ds, sales -> y, regressors.
-    """
-    # Prepare DataFrame for Prophet
+    """Trains Prophet. Requires columns: date -> ds, sales -> y, regressors."""
     prophet_df = df_train[['date', 'sales', 'sell_price']].copy()
     prophet_df.columns = ['ds', 'y', 'sell_price']
     
-    # Configure Prophet
     model = Prophet(
         growth='linear',
         daily_seasonality=False,
@@ -187,14 +207,12 @@ def train_prophet_model(df_train):
 # ==========================================
 def recursive_predict(model, df, start_day, model_type):
     """
-    Recursive Engine for Tree Models (LGBM, XGB).
+    Recursive Engine for Tree Models (LGBM, XGB, CatBoost).
     """
-    # Create features ONLY for tree models
     df = create_features(df)
     
     exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
-                    'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
-                    'snap_CA', 'snap_TX', 'snap_WI']
+                    'sales', 'd', 'date', 'wm_yr_wk', 'd_num']
     
     features = [c for c in df.columns if c not in exclude_cols]
     future_horizon = 28
@@ -214,9 +232,11 @@ def recursive_predict(model, df, start_day, model_type):
         # 2. Inference
         if model_type == 'LightGBM':
             pred = model.predict(X_test)[0]
-        else: # XGBoost
+        elif model_type == 'XGBoost':
             dtest = xgb.DMatrix(X_test, enable_categorical=True)
             pred = model.predict(dtest)[0]
+        elif model_type == 'CatBoost':
+            pred = model.predict(X_test)[0]
         
         # 3. Update Sales for recursion
         pred = max(0, pred) 
@@ -228,30 +248,20 @@ def recursive_predict(model, df, start_day, model_type):
     return df, features
 
 def batch_predict_prophet(model, grid, start_day):
-    """
-    Batch Engine for Prophet.
-    """
-    # Filter for future range
+    """Batch Engine for Prophet."""
     future_mask = grid['d_num'] >= start_day
     future_df = grid[future_mask][['date', 'sell_price']].copy()
     future_df.columns = ['ds', 'sell_price']
     
-    # Predict
     forecast = model.predict(future_df)
-    
-    # Map back to grid
     grid.loc[future_mask, 'sales'] = forecast['yhat'].values
     
-    # Return grid and dummy features list (Prophet doesn't use feature lists like Trees)
     return grid, ['sell_price', 'trend', 'weekly', 'yearly']
 
 def calculate_inventory_plan(df, start_day, rmse, lead_time, service_level_z, initial_stock):
-    """
-    Advanced Inventory Logic
-    """
+    """Advanced Inventory Logic"""
     plan = df[df['d_num'] >= start_day].copy()
     
-    # Calculate Safety Stock using RMSE
     plan['safety_stock'] = service_level_z * rmse * np.sqrt(lead_time)
     
     inventory_levels = []
@@ -332,40 +342,84 @@ def plot_interactive_lifecycle(history, forecast, item, rmse):
     return fig
 
 def plot_interactive_action_plan(plan, item):
+    """
+    Advanced Inventory Action Plan Plot
+    - Highlights Safety Stock Threshold (Red Zone)
+    - Explicitly marks Reorder Events (Green Bars)
+    """
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     
     x_axis = plan['date'] if 'date' in plan.columns else plan['d_num']
     
+    # 1. Safety Stock Zone
     fig.add_trace(
-        go.Scatter(x=x_axis, y=plan['sales'], name="Predicted Demand",
-                   line=dict(color='#636EFA', width=3)),
+        go.Scatter(
+            x=x_axis, 
+            y=plan['safety_stock'], 
+            name="Safety Stock (Risk Threshold)",
+            line=dict(color='rgba(255, 99, 71, 0.5)', width=1, dash='dash'),
+            fill='tozeroy',
+            fillcolor='rgba(255, 99, 71, 0.1)', 
+            hoverinfo='skip'
+        ),
+        secondary_y=False
+    )
+
+    # 2. Predicted Demand
+    fig.add_trace(
+        go.Scatter(
+            x=x_axis, 
+            y=plan['sales'], 
+            name="Predicted Daily Demand",
+            line=dict(color='#A0A0A0', width=1.5, dash='dot'), 
+            opacity=0.6
+        ),
         secondary_y=False
     )
     
+    # 3. Projected Inventory Level
     fig.add_trace(
-        go.Scatter(x=x_axis, y=plan['projected_inventory'], name="Projected Inventory",
-                   line=dict(width=0), fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.1)'),
+        go.Scatter(
+            x=x_axis, 
+            y=plan['projected_inventory'], 
+            name="Projected Stock Level",
+            line=dict(color='#1F77B4', width=3),
+            fill='tonexty', 
+            fillcolor='rgba(31, 119, 180, 0.05)'
+        ),
         secondary_y=False
     )
     
-    orders = plan[plan['recommended_order'] > 0.01]
+    # 4. Reorder Events
+    orders = plan[plan['recommended_order'] > 0]
     if not orders.empty:
         x_orders = orders['date'] if 'date' in orders.columns else orders['d_num']
+        
         fig.add_trace(
-            go.Bar(x=x_orders, y=orders['recommended_order'], name="Recommended Order",
-                   marker_color='#EF553B', opacity=0.8),
+            go.Bar(
+                x=x_orders, 
+                y=orders['recommended_order'], 
+                name="Replenishment Order (Qty)",
+                marker_color='#2CA02C',
+                opacity=0.9,
+                text=orders['recommended_order'].astype(int), 
+                textposition='auto'
+            ),
             secondary_y=True
         )
-    
+
     fig.update_layout(
-        title=f"<b>Supply Chain Action Plan: {item}</b>",
+        title=dict(text=f"<b>🛡️ Inventory Strategy & Replenishment Plan: {item}</b>", font=dict(size=20)),
         template="plotly_white",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1, bgcolor="rgba(255,255,255,0.5)"),
+        height=550 
     )
     
-    fig.update_yaxes(title_text="Units (Demand/Stock)", secondary_y=False)
-    fig.update_yaxes(title_text="Units (Replenishment)", secondary_y=True, showgrid=False)
+    fig.update_yaxes(title_text="<b>Stock Level (Units)</b>", secondary_y=False, showgrid=True, gridcolor='#F0F0F0')
+    max_order = plan['recommended_order'].max() if not plan['recommended_order'].empty else 10
+    fig.update_yaxes(title_text="<b>Order Quantity</b>", secondary_y=True, showgrid=False, range=[0, max_order * 1.5])
+    
     return fig
 
 def plot_feature_importance(model, features, model_type):
@@ -374,9 +428,11 @@ def plot_feature_importance(model, features, model_type):
         
     if model_type == 'LightGBM':
         importance = model.feature_importance(importance_type='gain')
-    else: # XGBoost
+    elif model_type == 'XGBoost':
         importance_map = model.get_score(importance_type='gain')
         importance = [importance_map.get(f, 0) for f in features]
+    elif model_type == 'CatBoost':
+        importance = model.get_feature_importance()
         
     fi_df = pd.DataFrame({'Feature': features, 'Importance': importance})
     fi_df = fi_df.sort_values(by='Importance', ascending=True).tail(15)
@@ -408,7 +464,8 @@ def main():
         selected_item = st.selectbox("Product SKU", data['item_id'].unique())
         
         st.subheader("Model Hyperparameters")
-        selected_model = st.radio("AI Architecture", ["LightGBM", "XGBoost", "Prophet"], index=0)
+        # Added CatBoost to options
+        selected_model = st.radio("AI Architecture", ["LightGBM", "XGBoost", "CatBoost", "Prophet"], index=0)
         
         st.markdown("---")
         st.subheader("Inventory Simulation Parameters")
@@ -432,14 +489,11 @@ def main():
             if selected_model == "Prophet":
                 st.write(f"🧠 Training {selected_model} (Bayesian Time Series)...")
                 
-                # Prophet trains on history only
                 train_mask = grid['d_num'] <= SPLIT_DAY
                 train_data = grid[train_mask]
                 
-                # Train
                 model = train_prophet_model(train_data)
                 
-                # Validate
                 val_mask = (grid['d_num'] > SPLIT_DAY - 28) & (grid['d_num'] <= SPLIT_DAY)
                 val_data = grid[val_mask][['date', 'sell_price']].copy()
                 val_data.columns = ['ds', 'sell_price']
@@ -448,27 +502,21 @@ def main():
                 
                 rmse = np.sqrt(mean_squared_error(y_val, val_preds))
                 
-                # Forecast
                 st.write("🔮 Generating Batch Forecast (28 Days Horizon)...")
                 forecast_grid, final_features = batch_predict_prophet(model, grid.copy(), 1914)
 
             else:
-                # Tree Models (LightGBM / XGBoost)
+                # Tree Models (LightGBM / XGBoost / CatBoost)
                 st.write("🔧 Engineering temporal features (Lags, Rolling Windows)...")
                 
-                # Create features 
                 grid_feat = create_features(grid)
-                
-                # FIX 1: Drop rows where lags are calculated (first 28 days usually become NaN)
                 grid_feat = grid_feat.dropna(subset=['lag_28', 'rolling_mean_28'])
                 
-                # FIX 2: XGBoost FATAL ERROR FIX
-                # We must ensure the 'sales' (target) column has NO NaNs for training
+                # Fatal Error Fix: XGBoost/CatBoost demand clean targets
                 grid_feat = grid_feat.dropna(subset=['sales'])
 
                 exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
-                                'sales', 'd', 'date', 'wm_yr_wk', 'd_num', 
-                                'snap_CA', 'snap_TX', 'snap_WI']
+                                'sales', 'd', 'date', 'wm_yr_wk', 'd_num']
                 features = [c for c in grid_feat.columns if c not in exclude_cols]
                 
                 train_mask = grid_feat['d_num'] <= SPLIT_DAY - 28
@@ -483,15 +531,17 @@ def main():
                 if selected_model == "LightGBM":
                     model = train_lightgbm(X_train, y_train, X_val, y_val)
                     val_preds = model.predict(X_val)
-                else:
+                elif selected_model == "XGBoost":
                     model = train_xgboost(X_train, y_train, X_val, y_val)
                     dval = xgb.DMatrix(X_val, enable_categorical=True)
                     val_preds = model.predict(dval)
+                elif selected_model == "CatBoost":
+                    model = train_catboost(X_train, y_train, X_val, y_val, features)
+                    val_preds = model.predict(X_val)
                 
                 rmse = np.sqrt(mean_squared_error(y_val, val_preds))
                 
                 st.write("🔮 Generating Recursive Forecast (28 Days Horizon)...")
-                # Pass the original 'grid' (raw data) to recursive engine
                 forecast_grid, final_features = recursive_predict(model, grid.copy(), 1914, selected_model)
             
             status.update(label="Analysis Complete!", state="complete", expanded=False)
