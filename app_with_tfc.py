@@ -6,15 +6,13 @@ import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor, Pool
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import mean_squared_error
-from prophet import Prophet 
 import warnings
 import logging
 
-# --- PyTorch Imports for TF-C ---
+# --- PyTorch Imports ---
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,20 +23,18 @@ from torch.utils.data import DataLoader, TensorDataset
 # 0. High-Performance Configuration
 # ==========================================
 st.set_page_config(
-    page_title="Supply Chain AI Cortex | Enterprise Edition",
+    page_title="Supply Chain AI Cortex | Enterprise Matrix",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="📈"
 )
 warnings.filterwarnings('ignore')
 
-# Suppress Prophet's verbose logging
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Custom CSS for "Dark Mode" Professional Look & Terminal
 st.markdown("""
 <style>
     .stMetric {
@@ -47,9 +43,7 @@ st.markdown("""
         padding: 15px;
         border-radius: 5px;
     }
-    .stProgress .st-bo {
-        background-color: #00AA00;
-    }
+    .stProgress .st-bo { background-color: #00AA00; }
     .log-terminal {
         background-color: #000000;
         color: #00FF00;
@@ -66,71 +60,85 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. Data Pipeline
+# 1. Global Data Pipeline & Temporal Engineering
 # ==========================================
 @st.cache_data
-def load_lean_data(filepath='mini_data/mini_sales.csv', cal_path='mini_data/mini_calendar.csv', price_path='mini_data/mini_prices.csv'):
-    """Loads and caches the optimized dataset. Adjust paths to match your Codespace."""
+def load_lean_data(filepath='m5_lean.csv'):
     try:
-        # If you are using the single m5_lean.csv, modify this block. 
-        # Assuming the merged m5_lean.csv structure for this unified code:
-        df = pd.read_csv('m5_lean.csv')
-        
-        # Robust Date Reconstruction
+        df = pd.read_csv(filepath)
         if 'd_num' not in df.columns:
             df['d_num'] = df['d'].apply(lambda x: int(x.split('_')[1]))
-
         if 'date' not in df.columns:
             start_date = pd.Timestamp("2011-01-29")
             df['date'] = start_date + pd.to_timedelta(df['d_num'] - 1, unit='D')
         else:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            
         return df
     except FileNotFoundError:
         return None
 
-def create_features(df):
-    """Rigorously regenerates temporal features for Tree Models."""
+def extend_grid_global(df, horizon, start_day):
     df = df.copy()
+    max_day = df['d_num'].max()
+    target_end_day = start_day + horizon - 1
     
-    df['lag_1'] = df['sales'].shift(1)
-    df['lag_7'] = df['sales'].shift(7)
-    df['lag_14'] = df['sales'].shift(14)
-    df['lag_28'] = df['sales'].shift(28)
-    
-    df['rolling_mean_7'] = df['sales'].shift(1).rolling(7).mean()
-    df['rolling_std_7'] = df['sales'].shift(1).rolling(7).std()
-    df['rolling_mean_28'] = df['sales'].shift(1).rolling(28).mean()
-    
-    df['price_change'] = df['sell_price'].pct_change()
-    df['price_volatility'] = df['sell_price'].rolling(7).std()
-    
+    if target_end_day > max_day:
+        future_rows = []
+        last_states = df[df['d_num'] == max_day]
+        for d in range(max_day + 1, target_end_day + 1):
+            for _, row in last_states.iterrows():
+                new_row = row.copy()
+                new_row['d'] = f"d_{d}"
+                new_row['d_num'] = d
+                new_row['date'] = row['date'] + pd.Timedelta(days=d - max_day)
+                new_row['sales'] = np.nan 
+                future_rows.append(new_row)
+        df = pd.concat([df, pd.DataFrame(future_rows)], ignore_index=True)
     return df
 
-def prepare_training_data(df, item_id, store_id):
-    """Filters and encodes data for a specific time-series."""
-    data = df[(df['item_id'] == item_id) & (df['store_id'] == store_id)].copy()
+def create_features_global(df):
+    df = df.copy().sort_values(by=['item_id', 'd_num'])
     
-    data['wday'] = data['date'].dt.dayofweek
-    data['month'] = data['date'].dt.month - 1
+    df['date'] = pd.to_datetime(df['date'])
+    df['dayofweek'] = df['date'].dt.dayofweek
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+    df['month'] = df['date'].dt.month
+    df['dayofmonth'] = df['date'].dt.day 
+
+    df['lag_1'] = df.groupby('item_id')['sales'].shift(1)
+    df['lag_7'] = df.groupby('item_id')['sales'].shift(7)
+    df['lag_14'] = df.groupby('item_id')['sales'].shift(14)
+    df['lag_28'] = df.groupby('item_id')['sales'].shift(28)
     
-    le = LabelEncoder()
+    df['shifted_sales'] = df['lag_1']
+    df['rolling_mean_7'] = df.groupby('item_id')['shifted_sales'].transform(lambda x: x.rolling(7).mean())
+    df['rolling_std_7'] = df.groupby('item_id')['shifted_sales'].transform(lambda x: x.rolling(7).std())
+    df['rolling_mean_28'] = df.groupby('item_id')['shifted_sales'].transform(lambda x: x.rolling(28).mean())
+    
+    df['price_change'] = df.groupby('item_id')['sell_price'].pct_change()
+    df['price_volatility'] = df.groupby('item_id')['sell_price'].transform(lambda x: x.rolling(7).std())
+    
+    df.drop(columns=['shifted_sales'], inplace=True)
+    return df
+
+def prepare_global_training_data(df, selected_items, store_id):
+    data = df[(df['item_id'].isin(selected_items)) & (df['store_id'] == store_id)].copy()
+    
+    le_event = LabelEncoder()
     data['event_name_1'] = data['event_name_1'].astype(str).fillna('None')
-    data['event_name_1'] = le.fit_transform(data['event_name_1'])
-    data['event_name_1'] = data['event_name_1'].astype(int) 
+    data['event_name_1'] = le_event.fit_transform(data['event_name_1']).astype(int) 
     
-    for col in ['snap_CA', 'snap_TX', 'snap_WI']:
-        if col in data.columns:
-            data[col] = data[col].fillna(0).astype(int)
-            
-    return data
+    le_item = LabelEncoder()
+    data['item_id_encoded'] = le_item.fit_transform(data['item_id']).astype(int)
+    
+    # PERFECTION LAYER: We intentionally leave these as raw integers here. 
+    # We will cast them mathematically right before training to preserve schema indexing.
+    return data, le_item
 
 # ==========================================
-# 2. PyTorch TF-C Architecture (Corrected)
+# 2. PyTorch TF-C Architecture (Globalized)
 # ==========================================
 class PositionalEncoding(nn.Module):
-    """Injects absolute temporal positioning into the sequence."""
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model)
@@ -147,7 +155,6 @@ class PositionalEncoding(nn.Module):
 class AdvancedTFC(nn.Module):
     def __init__(self, seq_len, freq_len, num_cont_features, cat_cardinalities, d_model=64):
         super(AdvancedTFC, self).__init__()
-        
         self.embeddings = nn.ModuleList([
             nn.Embedding(card, min(10, (card + 1) // 2)) for card in cat_cardinalities
         ])
@@ -163,11 +170,8 @@ class AdvancedTFC(nn.Module):
         self.time_encoder = nn.TransformerEncoder(encoder_layer_t, num_layers=2)
         
         self.projector_t = nn.Sequential(
-            nn.Linear(d_model * seq_len, 128),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64)
+            nn.Linear(d_model * seq_len, 128), nn.BatchNorm1d(128),
+            nn.GELU(), nn.Dropout(0.2), nn.Linear(128, 64)
         )
 
         self.freq_input_proj = nn.Linear(1, d_model)
@@ -176,13 +180,9 @@ class AdvancedTFC(nn.Module):
             batch_first=True, dropout=0.2, norm_first=True
         )
         self.freq_encoder = nn.TransformerEncoder(encoder_layer_f, num_layers=2)
-        
         self.projector_f = nn.Sequential(
-            nn.Linear(d_model * freq_len, 128),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64)
+            nn.Linear(d_model * freq_len, 128), nn.BatchNorm1d(128),
+            nn.GELU(), nn.Dropout(0.2), nn.Linear(128, 64)
         )
 
     def forward(self, x_cont, x_cat, x_freq):
@@ -207,12 +207,9 @@ class ForecasterHead(nn.Module):
     def __init__(self, time_dim, freq_dim):
         super(ForecasterHead, self).__init__()
         self.regressor = nn.Sequential(
-            nn.Linear(time_dim + freq_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 1)
+            nn.Linear(time_dim + freq_dim, 128), nn.ReLU(),
+            nn.Dropout(0.1), nn.Linear(128, 1)
         )
-
     def forward(self, h_t_flat, h_f_flat):
         return self.regressor(torch.cat((h_t_flat, h_f_flat), dim=1))
 
@@ -237,72 +234,63 @@ class NTXentLoss(nn.Module):
             torch.arange(batch_size, 2 * batch_size, device=DEVICE),
             torch.arange(0, batch_size, device=DEVICE)
         ], dim=0)
-        
-        loss = self.criterion(similarity_matrix, labels)
-        return loss / (2 * batch_size)
+        return self.criterion(similarity_matrix, labels) / (2 * batch_size)
 
-# ==========================================
-# 3. Training & Simulation Engines
-# ==========================================
-
-# --- TF-C Engine ---
-def prepare_tfc_tensors(df, seq_len=60):
+# --- Global TF-C Engineering ---
+def prepare_global_tfc_tensors(df, seq_len=60):
     sales_scaler = StandardScaler()
     price_scaler = StandardScaler()
     
-    work_df = df.copy()
+    work_df = df.copy().sort_values(by=['item_id', 'd_num'])
     work_df['sales'] = work_df['sales'].fillna(0)
-    work_df['sell_price'] = work_df['sell_price'].fillna(method='ffill').fillna(0)
+    work_df['sell_price'] = work_df.groupby('item_id')['sell_price'].fillna(method='ffill').fillna(0)
     
     work_df['sales_scaled'] = sales_scaler.fit_transform(work_df[['sales']])
     work_df['price_scaled'] = price_scaler.fit_transform(work_df[['sell_price']])
     
-    data_cont = work_df[['sales_scaled', 'price_scaled']].values
-    
-    cat_cols = ['wday', 'month', 'event_name_1']
-    for snap in ['snap_CA', 'snap_TX', 'snap_WI']:
-        if snap in work_df.columns: cat_cols.append(snap)
-    data_cat = work_df[cat_cols].values.astype(int)
+    cat_cols = ['item_id_encoded', 'event_name_1', 'dayofweek', 'is_weekend', 'month', 'dayofmonth']
+    cat_cards = [work_df[col].max() + 1 for col in cat_cols]
     
     X_cont, X_cat, X_freq, y = [], [], [], []
     
-    for i in range(len(work_df) - seq_len):
-        X_cont.append(data_cont[i : i + seq_len])
-        X_cat.append(data_cat[i : i + seq_len])
+    for item_id, group in work_df.groupby('item_id'):
+        data_cont = group[['sales_scaled', 'price_scaled']].values
+        data_cat = group[cat_cols].values.astype(int)
         
-        sales_window = data_cont[i : i + seq_len, 0]
-        fft_mag = np.abs(np.fft.rfft(sales_window))
-        fft_mag = (fft_mag - np.mean(fft_mag)) / (np.std(fft_mag) + 1e-6)
-        X_freq.append(fft_mag)
-        
-        y.append(data_cont[i + seq_len, 0])
-        
+        for i in range(len(group) - seq_len):
+            X_cont.append(data_cont[i : i + seq_len])
+            X_cat.append(data_cat[i : i + seq_len])
+            
+            sales_window = data_cont[i : i + seq_len, 0]
+            fft_mag = np.abs(np.fft.rfft(sales_window))
+            fft_mag = (fft_mag - np.mean(fft_mag)) / (np.std(fft_mag) + 1e-6)
+            X_freq.append(fft_mag)
+            
+            y.append(data_cont[i + seq_len, 0])
+            
     X_cont_t = torch.FloatTensor(np.array(X_cont))
     X_cat_t = torch.LongTensor(np.array(X_cat))
     X_freq_t = torch.FloatTensor(np.array(X_freq)).unsqueeze(-1)
     y_t = torch.FloatTensor(np.array(y)).unsqueeze(-1)
     
     scalers = {'sales': sales_scaler, 'price': price_scaler}
-    cat_cards = [work_df[col].max() + 1 for col in cat_cols]
-    
     return X_cont_t, X_cat_t, X_freq_t, y_t, scalers, cat_cards, cat_cols
 
-def train_tfc_model(X_cont, X_cat, X_freq, y, cat_cards, log_placeholder, pbar, epochs_pre=10, epochs_fine=15):
+def train_global_tfc_model(X_cont, X_cat, X_freq, y, cat_cards, log_placeholder, pbar, epochs_pre=10, epochs_fine=15):
     dataset = TensorDataset(X_cont, X_cat, X_freq, y)
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False)
     
     model = AdvancedTFC(seq_len=X_cont.shape[1], freq_len=X_freq.shape[1], 
                         num_cont_features=X_cont.shape[2], cat_cardinalities=cat_cards, d_model=64).to(DEVICE)
-    
     head = ForecasterHead(64 * X_cont.shape[1], 64 * X_freq.shape[1]).to(DEVICE)
     optimizer = optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3, weight_decay=1e-5)
     
-    log_text = "<b>[SYSTEM] Initializing TF-C Transformer Protocol...</b><br>"
+    log_text = "<b>[SYSTEM] Initializing Global TF-C Tensor Training...</b><br>"
     log_placeholder.markdown(f"<div class='log-terminal'>{log_text}</div>", unsafe_allow_html=True)
     
     total_epochs = epochs_pre + epochs_fine
@@ -330,7 +318,7 @@ def train_tfc_model(X_cont, X_cat, X_freq, y, cat_cards, log_placeholder, pbar, 
             total_loss += loss.item()
             
         current_epoch += 1
-        pbar.progress(current_epoch / total_epochs, text="Phase 1: Contrastive Pre-Training...")
+        pbar.progress(current_epoch / total_epochs, text="Phase 1: Global Contrastive Pre-Training...")
         log_text = f"[Phase 1] Epoch {epoch+1}/{epochs_pre} | Contrastive Loss: {total_loss/len(train_loader):.4f}<br>" + log_text
         log_placeholder.markdown(f"<div class='log-terminal'>{log_text}</div>", unsafe_allow_html=True)
 
@@ -344,8 +332,7 @@ def train_tfc_model(X_cont, X_cat, X_freq, y, cat_cards, log_placeholder, pbar, 
             xc, xcat, xf, yt = [b.to(DEVICE) for b in batch]
             optimizer.zero_grad()
             h_t, _, h_f, _ = model(xc, xcat, xf)
-            preds = head(h_t, h_f)
-            loss = criterion(preds, yt)
+            loss = criterion(head(h_t, h_f), yt)
             
             if torch.isnan(loss): continue
             loss.backward()
@@ -363,133 +350,109 @@ def train_tfc_model(X_cont, X_cat, X_freq, y, cat_cards, log_placeholder, pbar, 
                 
         final_val_mse = val_mse/len(val_loader) if len(val_loader) > 0 else 0.01
         current_epoch += 1
-        pbar.progress(current_epoch / total_epochs, text="Phase 2: Supervised Fine-Tuning...")
+        pbar.progress(current_epoch / total_epochs, text="Phase 2: Global Supervised Fine-Tuning...")
         log_text = f"[Phase 2] Epoch {epoch+1}/{epochs_fine} | Train MSE: {total_mse/len(train_loader):.4f} | Val MSE: {final_val_mse:.4f}<br>" + log_text
         log_placeholder.markdown(f"<div class='log-terminal'>{log_text}</div>", unsafe_allow_html=True)
 
     return model, head, final_val_mse
 
-def recursive_predict_tfc(model, head, grid, scalers, cat_cols, start_day, seq_len=60):
+def recursive_predict_global_tfc(model, head, grid, scalers, cat_cols, selected_items, start_day, horizon, seq_len=60):
     model.eval()
     head.eval()
+    sim_grid = grid.copy().sort_values(by=['item_id', 'd_num'])
+    progress_bar = st.progress(0, text="Running Vectorized TF-C Simulation...")
     
-    future_horizon = 28
-    train_history = grid[grid['d_num'] < start_day].iloc[-seq_len:].copy()
-    
-    future_mask = grid['d_num'] >= start_day
-    future_meta = grid[future_mask].iloc[:future_horizon].copy()
-    
-    current_window = train_history.copy()
-    predictions = []
-    
-    for i in range(future_horizon):
-        s_data = scalers['sales'].transform(current_window[['sales']].fillna(0)).reshape(-1,1)
-        p_data = scalers['price'].transform(current_window[['sell_price']].fillna(0)).reshape(-1,1)
-        xc = torch.FloatTensor(np.hstack([s_data, p_data])).unsqueeze(0).to(DEVICE)
+    for i in range(horizon):
+        target_day = start_day + i
+        batch_xc, batch_xcat, batch_xf = [], [], []
         
-        cats = current_window[cat_cols].values.astype(int)
-        xcat = torch.LongTensor(cats).unsqueeze(0).to(DEVICE)
-        
-        fft = np.abs(np.fft.rfft(s_data.flatten()))
-        xf = torch.FloatTensor((fft - np.mean(fft))/(np.std(fft)+1e-6)).unsqueeze(0).unsqueeze(-1).to(DEVICE)
+        for item in selected_items:
+            history_window = sim_grid[(sim_grid['item_id'] == item) & (sim_grid['d_num'] < target_day)].tail(seq_len)
+            
+            s_data = scalers['sales'].transform(history_window[['sales']].fillna(0)).reshape(-1, 1)
+            p_data = scalers['price'].transform(history_window[['sell_price']].fillna(0)).reshape(-1, 1)
+            batch_xc.append(np.hstack([s_data, p_data]))
+            
+            batch_xcat.append(history_window[cat_cols].values.astype(int))
+            
+            fft = np.abs(np.fft.rfft(s_data.flatten()))
+            batch_xf.append((fft - np.mean(fft)) / (np.std(fft) + 1e-6))
+            
+        xc_t = torch.FloatTensor(np.array(batch_xc)).to(DEVICE)
+        xcat_t = torch.LongTensor(np.array(batch_xcat)).to(DEVICE)
+        xf_t = torch.FloatTensor(np.array(batch_xf)).unsqueeze(-1).to(DEVICE)
         
         with torch.no_grad():
-            ht, _, hf, _ = model(xc, xcat, xf)
-            pred_scaled = head(ht, hf).item()
+            ht, _, hf, _ = model(xc_t, xcat_t, xf_t)
+            preds_scaled = head(ht, hf).cpu().numpy()
             
-        pred_real = scalers['sales'].inverse_transform([[pred_scaled]])[0][0]
-        pred_real = max(0, pred_real)
-        predictions.append(pred_real)
+        preds_real = scalers['sales'].inverse_transform(preds_scaled).flatten()
+        preds_real = np.maximum(0, preds_real)
         
-        next_row = future_meta.iloc[i].copy()
-        next_row['sales'] = pred_real
-        current_window = pd.concat([current_window.iloc[1:], next_row.to_frame().T])
+        mask = (sim_grid['d_num'] == target_day) & (sim_grid['item_id'].isin(selected_items))
+        sim_grid.loc[mask, 'sales'] = preds_real
+        progress_bar.progress((i + 1) / horizon, text=f"Simulating Day {target_day} across Deep Tensor...")
+        
+    progress_bar.empty()
+    return sim_grid
 
-    grid.loc[future_mask, 'sales'] = predictions
-    return grid
+# ==========================================
+# 3. Global Tree Architectures
+# ==========================================
+def train_lightgbm_global(X_train, y_train, X_val, y_val, lr, iterations):
+    params = {'objective': 'tweedie', 'tweedie_variance_power': 1.1, 'metric': 'rmse', 'learning_rate': lr, 'num_leaves': 128, 'max_depth': 8, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'lambda_l1': 0.5, 'lambda_l2': 0.5, 'n_jobs': -1, 'verbosity': -1}
+    cat_features = ['item_id_encoded', 'event_name_1', 'dayofweek', 'is_weekend', 'month', 'dayofmonth']
+    valid_cats = [c for c in cat_features if c in X_train.columns]
+    return lgb.train(params, lgb.Dataset(X_train, label=y_train, categorical_feature=valid_cats), num_boost_round=iterations, valid_sets=[lgb.Dataset(X_train, label=y_train, categorical_feature=valid_cats), lgb.Dataset(X_val, label=y_val, reference=lgb.Dataset(X_train, label=y_train, categorical_feature=valid_cats), categorical_feature=valid_cats)], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
 
-# --- Tree and Prophet Functions ---
-def train_lightgbm(X_train, y_train, X_val, y_val):
-    params = {'objective': 'tweedie', 'tweedie_variance_power': 1.1, 'metric': 'rmse',
-              'learning_rate': 0.03, 'num_leaves': 64, 'feature_fraction': 0.8,
-              'bagging_fraction': 0.7, 'bagging_freq': 1, 'lambda_l1': 0.1, 
-              'lambda_l2': 0.1, 'n_jobs': -1, 'verbosity': -1}
-    train_set = lgb.Dataset(X_train, label=y_train)
-    val_set = lgb.Dataset(X_val, label=y_val, reference=train_set)
-    return lgb.train(params, train_set, num_boost_round=1500, valid_sets=[train_set, val_set],
-                     callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
-
-def train_xgboost(X_train, y_train, X_val, y_val):
+def train_xgboost_global(X_train, y_train, X_val, y_val, lr, iterations):
     y_train, y_val = y_train.astype(float), y_val.astype(float)
     dtrain = xgb.DMatrix(X_train, label=y_train, enable_categorical=True)
     dval = xgb.DMatrix(X_val, label=y_val, enable_categorical=True)
-    params = {'objective': 'reg:tweedie', 'tweedie_variance_power': 1.1, 'eval_metric': 'rmse',
-              'eta': 0.03, 'max_depth': 8, 'subsample': 0.7, 'colsample_bytree': 0.7,
-              'alpha': 0.1, 'lambda': 0.1, 'nthread': -1, 'verbosity': 0}
-    return xgb.train(params, dtrain, num_boost_round=1500, evals=[(dtrain, 'train'), (dval, 'eval')],
-                     early_stopping_rounds=100, verbose_eval=False)
+    params = {'objective': 'reg:tweedie', 'tweedie_variance_power': 1.1, 'eval_metric': 'rmse', 'eta': lr, 'max_depth': 8, 'subsample': 0.8, 'colsample_bytree': 0.8, 'alpha': 0.5, 'lambda': 0.5, 'nthread': -1, 'verbosity': 0}
+    return xgb.train(params, dtrain, num_boost_round=iterations, evals=[(dtrain, 'train'), (dval, 'eval')], early_stopping_rounds=100, verbose_eval=False)
 
-def train_catboost(X_train, y_train, X_val, y_val, features):
-    cat_cols = ['event_name_1', 'snap_CA', 'snap_TX', 'snap_WI']
-    cat_indices = [features.index(c) for c in cat_cols if c in features]
-    train_pool = Pool(X_train, y_train, cat_features=cat_indices)
-    val_pool = Pool(X_val, y_val, cat_features=cat_indices)
-    model = CatBoostRegressor(iterations=1500, learning_rate=0.03, depth=6, l2_leaf_reg=3,
-                              loss_function='Tweedie:variance_power=1.1', eval_metric='RMSE',
-                              random_seed=42, early_stopping_rounds=100, verbose=0, allow_writing_files=False)
-    model.fit(train_pool, eval_set=val_pool, use_best_model=True)
-    return model
-
-def train_prophet_model(df_train):
-    prophet_df = df_train[['date', 'sales', 'sell_price']].copy()
-    prophet_df.columns = ['ds', 'y', 'sell_price']
-    model = Prophet(growth='linear', daily_seasonality=False, weekly_seasonality=True,
-                    yearly_seasonality=True, seasonality_mode='multiplicative', interval_width=0.95)
-    model.add_regressor('sell_price')
-    model.fit(prophet_df)
-    return model
-
-def recursive_predict(model, df, start_day, model_type):
-    df = create_features(df)
-    exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 
-                    'sales', 'd', 'date', 'wm_yr_wk', 'd_num']
-    features = [c for c in df.columns if c not in exclude_cols]
+def recursive_predict_global_trees(model, df, start_day, horizon, model_type, cat_dtypes):
+    """
+    CRITICAL FIX: Enforces frozen categorical boundaries onto validation slices 
+    to prevent Pandas fragmentation errors.
+    """
+    exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 'sales', 'd', 'date', 'wm_yr_wk', 'd_num']
+    pbar = st.progress(0, text="Running Vectorized Global Simulation...")
     
-    pbar = st.progress(0, text="Running Recursive Stochastic Simulation...")
-    for i, day in enumerate(range(start_day, start_day + 28)):
-        df = create_features(df)
+    for i, day in enumerate(range(start_day, start_day + horizon)):
+        df = create_features_global(df)
+        features = [c for c in df.columns if c not in exclude_cols]
         mask = df['d_num'] == day
-        X_test = df[mask][features]
+        X_test = df[mask][features].copy()
+        
         if X_test.empty: break
+        
+        # Enforce exact mathematical schema from the training environment
+        for col, dtype in cat_dtypes.items():
+            if col in X_test.columns:
+                X_test[col] = X_test[col].astype(dtype)
+        
+        if model_type == 'LightGBM': 
+            preds = model.predict(X_test)
+        elif model_type == 'XGBoost': 
+            preds = model.predict(xgb.DMatrix(X_test, enable_categorical=True))
+        elif model_type == 'CatBoost': 
+            preds = model.predict(X_test)
             
-        if model_type == 'LightGBM' or model_type == 'CatBoost':
-            pred = model.predict(X_test)[0]
-        elif model_type == 'XGBoost':
-            dtest = xgb.DMatrix(X_test, enable_categorical=True)
-            pred = model.predict(dtest)[0]
-            
-        df.loc[mask, 'sales'] = max(0, pred)
-        pbar.progress((i + 1) / 28, text=f"Simulating Day {day}...")
+        df.loc[mask, 'sales'] = np.maximum(0, preds) 
+        pbar.progress((i + 1) / horizon, text=f"Simulating Day {day} across Global Tensor...")
+        
     pbar.empty()
     return df, features
 
-def batch_predict_prophet(model, grid, start_day):
-    future_mask = grid['d_num'] >= start_day
-    future_df = grid[future_mask][['date', 'sell_price']].copy()
-    future_df.columns = ['ds', 'sell_price']
-    forecast = model.predict(future_df)
-    grid.loc[future_mask, 'sales'] = forecast['yhat'].values
-    return grid, ['sell_price', 'trend', 'weekly', 'yearly']
-
-# ==========================================
-# 4. Logistics & Visualization
-# ==========================================
-def calculate_inventory_plan(df, start_day, rmse, lead_time, service_level_z, initial_stock):
-    plan = df[df['d_num'] >= start_day].copy()
+def calculate_inventory_plan(df, start_day, horizon, rmse, lead_time, service_level_z, initial_stock, item_id):
+    plan_mask = (df['d_num'] >= start_day) & (df['d_num'] < start_day + horizon) & (df['item_id'] == item_id)
+    plan = df[plan_mask].copy().sort_values(by='d_num')
     plan['safety_stock'] = service_level_z * rmse * np.sqrt(lead_time)
+    
     inventory_levels, order_quantities = [], []
     stock = initial_stock
-    
     for _, row in plan.iterrows():
         reorder_point = row['safety_stock'] + (row['sales'] * lead_time)
         order_qty = 0
@@ -504,206 +467,223 @@ def calculate_inventory_plan(df, start_day, rmse, lead_time, service_level_z, in
     plan['recommended_order'] = order_quantities
     return plan
 
-def plot_interactive_lifecycle(history, forecast, item, rmse):
-    history_view = history[history['d_num'] > (1913 - 120)]
+# ==========================================
+# 4. Interactive Visualization
+# ==========================================
+def plot_portfolio_comparison(portfolio_details):
     fig = go.Figure()
-    x_hist = history_view['date'] if 'date' in history_view.columns else history_view['d_num']
+    colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD', '#8C564B']
+    for idx, (item, details) in enumerate(portfolio_details.items()):
+        plan = details['plan']
+        x_axis = plan['date'] if 'date' in plan.columns else plan['d_num']
+        fig.add_trace(go.Scatter(x=x_axis, y=plan['projected_inventory'], name=f"{item}", mode='lines', line=dict(width=2, color=colors[idx % len(colors)])))
+    fig.update_layout(title=dict(text="<b>🌐 Global Portfolio Convergence</b>", font=dict(size=18)), template="plotly_white", hovermode="x unified", height=450, yaxis_title="Units on Hand", xaxis_title="Timeline")
+    return fig
+
+def plot_interactive_lifecycle(history, forecast, ground_truth, item, rmse):
+    history_view = history[history['d_num'] > (history['d_num'].max() - 120)]
+    reality = pd.concat([history_view, ground_truth]).dropna(subset=['sales']).sort_values(by='d_num')
+    fig = go.Figure()
+    x_real = reality['date'] if 'date' in reality.columns else reality['d_num']
+    fig.add_trace(go.Scatter(x=x_real, y=reality['sales'], mode='lines', name='Actual Sales (Reality)', line=dict(color='gray', width=1.5), opacity=0.7))
     x_fore = forecast['date'] if 'date' in forecast.columns else forecast['d_num']
-    
-    fig.add_trace(go.Scatter(x=x_hist, y=history_view['sales'], mode='lines', name='Historical Sales', line=dict(color='gray', width=1.5), opacity=0.6))
     fig.add_trace(go.Scatter(x=x_fore, y=forecast['sales'], mode='lines+markers', name='AI Forecast', line=dict(color='#00CC96', width=3), marker=dict(size=5)))
-    
-    upper = forecast['sales'] + (1.96 * rmse)
-    lower = forecast['sales'] - (1.96 * rmse)
-    lower = lower.apply(lambda x: max(0, x))
-    fig.add_trace(go.Scatter(x=pd.concat([x_fore, x_fore[::-1]]), y=pd.concat([upper, lower[::-1]]), fill='toself', fillcolor='rgba(0, 204, 150, 0.2)', line=dict(color='rgba(255,255,255,0)'), hoverinfo="skip", name='95% Confidence Interval'))
-    
-    fig.update_layout(title=f"<b>Deep Learning Trajectory: {item}</b>", xaxis_title="Date", yaxis_title="Sales Volume", template="plotly_white", hovermode="x unified", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
+    upper_bound = forecast['sales'] + (1.96 * rmse)
+    lower_bound = forecast['sales'].apply(lambda x: max(0, x - (1.96 * rmse)))
+    fig.add_trace(go.Scatter(x=pd.concat([x_fore, x_fore[::-1]]), y=pd.concat([upper_bound, lower_bound[::-1]]), fill='toself', fillcolor='rgba(0, 204, 150, 0.2)', line=dict(color='rgba(255,255,255,0)'), hoverinfo="skip", name='95% Confidence Interval'))
+    fig.update_layout(title=f"<b>Deep Learning Trajectory vs Reality: {item}</b>", xaxis_title="Date", yaxis_title="Sales Volume", template="plotly_white", hovermode="x unified", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01), height=450)
     return fig
 
 def plot_interactive_action_plan(plan, item):
-    """Advanced Inventory Action Plan Plot with Risk Zones and Replenishment Bars"""
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     x_axis = plan['date'] if 'date' in plan.columns else plan['d_num']
-    
     fig.add_trace(go.Scatter(x=x_axis, y=plan['safety_stock'], name="Safety Stock (Risk Threshold)", line=dict(color='rgba(255, 99, 71, 0.5)', width=1, dash='dash'), fill='tozeroy', fillcolor='rgba(255, 99, 71, 0.1)', hoverinfo='skip'), secondary_y=False)
     fig.add_trace(go.Scatter(x=x_axis, y=plan['sales'], name="Predicted Daily Demand", line=dict(color='#A0A0A0', width=1.5, dash='dot'), opacity=0.6), secondary_y=False)
     fig.add_trace(go.Scatter(x=x_axis, y=plan['projected_inventory'], name="Projected Stock Level", line=dict(color='#1F77B4', width=3), fill='tonexty', fillcolor='rgba(31, 119, 180, 0.05)'), secondary_y=False)
-    
     orders = plan[plan['recommended_order'] > 0]
     if not orders.empty:
         x_orders = orders['date'] if 'date' in orders.columns else orders['d_num']
         fig.add_trace(go.Bar(x=x_orders, y=orders['recommended_order'], name="Replenishment Order (Qty)", marker_color='#2CA02C', opacity=0.9, text=orders['recommended_order'].astype(int), textposition='auto'), secondary_y=True)
-
     fig.update_layout(title=dict(text=f"<b>🛡️ Inventory Strategy & Replenishment Plan: {item}</b>", font=dict(size=20)), template="plotly_white", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1, bgcolor="rgba(255,255,255,0.5)"), height=550)
     fig.update_yaxes(title_text="<b>Stock Level (Units)</b>", secondary_y=False, showgrid=True, gridcolor='#F0F0F0')
     max_order = plan['recommended_order'].max() if not plan['recommended_order'].empty else 10
     fig.update_yaxes(title_text="<b>Order Quantity</b>", secondary_y=True, showgrid=False, range=[0, max_order * 1.5])
     return fig
 
-def plot_feature_importance(model, features, model_type):
-    if model_type in ['Prophet', 'TF-C (Transformer)']: return None
-        
-    if model_type == 'LightGBM':
-        importance = model.feature_importance(importance_type='gain')
-    elif model_type == 'XGBoost':
-        importance_map = model.get_score(importance_type='gain')
-        importance = [importance_map.get(f, 0) for f in features]
-    elif model_type == 'CatBoost':
-        importance = model.get_feature_importance()
-        
-    fi_df = pd.DataFrame({'Feature': features, 'Importance': importance}).sort_values(by='Importance', ascending=True).tail(15)
-    fig = px.bar(fi_df, x='Importance', y='Feature', orientation='h', title='<b>Model Explainability: Top Drivers</b>', color='Importance', color_continuous_scale='Viridis')
-    fig.update_layout(template="plotly_white")
-    return fig
-
 # ==========================================
 # 5. Main Application Logic
 # ==========================================
 def main():
-    st.title("🧠 Supply Chain AI Cortex")
-    st.markdown("### Next-Gen Stochastic Forecasting & Replenishment System")
+    st.title("🧠 Supply Chain AI Cortex | Global Matrix Edition")
+    st.markdown("### Unified Omniscient Architecture for Category Processing")
     
     data = load_lean_data()
     if data is None:
-        st.error("⚠️ System Offline: `m5_lean.csv` not detected. Please execute the data engineering pipeline.")
+        st.error("⚠️ System Offline: `m5_lean.csv` not detected.")
         return
 
     with st.sidebar:
-        st.header("⚙️ Configuration")
+        st.header("⚙️ System Configuration")
         selected_store = st.selectbox("Store Location", data['store_id'].unique())
-        selected_item = st.selectbox("Product SKU", data['item_id'].unique())
+        available_items = data['item_id'].unique()
+        selected_items = st.multiselect("Select Product Portfolio", available_items, default=available_items[:3])
         
-        st.subheader("Model Hyperparameters")
-        selected_model = st.radio("AI Architecture", ["LightGBM", "XGBoost", "CatBoost", "Prophet", "TF-C (Transformer)"], index=0)
-        
-        if selected_model == "TF-C (Transformer)":
-            st.markdown("---")
-            st.markdown("**TF-C Deep Learning Params**")
-            epochs_pre = st.slider("Pre-training Epochs (Contrastive)", 1, 30, 5)
-            epochs_fine = st.slider("Fine-Tuning Epochs (MSE)", 1, 30, 5)
-        
-        st.markdown("---")
-        st.subheader("Inventory Simulation Parameters")
+        st.subheader("Global Parameters")
+        forecast_horizon = st.slider("Forecast Horizon (Days)", 7, 90, 28, 7)
         lead_time = st.slider("Supplier Lead Time (Days)", 1, 14, 3)
         service_level = st.slider("Target Service Level (%)", 80, 99, 95)
-        current_stock = st.number_input("Current Stock On-Hand", min_value=0, value=50)
+        current_stock = st.number_input("Current Stock Per Item", min_value=0, value=50)
         z_score = {99: 2.33, 95: 1.64, 90: 1.28, 85: 1.04, 80: 0.84}.get(service_level, 1.64)
 
-    if st.button("🚀 Run AI Analysis", type="primary"):
-        with st.status("Initializing AI Cortex...", expanded=True) as status:
-            st.write("🔧 Preparing Data Grid...")
-            grid = prepare_training_data(data, selected_item, selected_store)
-            SPLIT_DAY = 1913
+        with st.expander("🛠️ Advanced AI Parameters"):
+            selected_model = st.radio("Architecture", ["LightGBM", "XGBoost", "CatBoost", "TF-C (Transformer)"], index=0)
             
-            # --- BRANCHING LOGIC ---
-            if selected_model == "Prophet":
-                st.write(f"🧠 Training {selected_model} (Bayesian Time Series)...")
-                train_mask = grid['d_num'] <= SPLIT_DAY
-                model = train_prophet_model(grid[train_mask])
-                
-                val_mask = (grid['d_num'] > SPLIT_DAY - 28) & (grid['d_num'] <= SPLIT_DAY)
-                val_data = grid[val_mask][['date', 'sell_price']].copy()
-                val_data.columns = ['ds', 'sell_price']
-                val_preds = model.predict(val_data)['yhat'].values
-                y_val = grid[val_mask]['sales'].values
-                rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-                
-                st.write("🔮 Generating Batch Forecast (28 Days Horizon)...")
-                forecast_grid, final_features = batch_predict_prophet(model, grid.copy(), 1914)
+            if selected_model == "TF-C (Transformer)":
+                st.markdown("---")
+                st.markdown("**TF-C Deep Learning Params**")
+                epochs_pre = st.slider("Pre-training Epochs (Contrastive)", 1, 30, 5)
+                epochs_fine = st.slider("Fine-Tuning Epochs (MSE)", 1, 30, 5)
+            else:
+                learning_rate = st.number_input("Learning Rate", value=0.03)
+                iterations = st.number_input("Boosting Iterations", value=1000, step=100)
 
-            elif selected_model == "TF-C (Transformer)":
-                st.write(f"🧠 Initiating Deep Learning: {selected_model}")
+    if st.button("🚀 Run Global AI Engine", type="primary"):
+        if not selected_items:
+            st.warning("Please select at least one item.")
+            return
+
+        SPLIT_DAY = 1913
+        st.session_state['portfolio_details'] = {} 
+        master_metrics = {'total_demand': 0, 'capital_tied': 0, 'item_rmses': {}}
+        
+        with st.status("Initializing Unified Global Engine...", expanded=True) as status:
+            grid, le_item = prepare_global_training_data(data, selected_items, selected_store)
+            grid = extend_grid_global(grid, forecast_horizon, SPLIT_DAY + 1)
+            grid = create_features_global(grid)
+            
+            # --- TF-C Transformer Execution Path ---
+            if selected_model == "TF-C (Transformer)":
+                st.write(f"🧠 Initiating Deep Learning Tensor Protocol: {selected_model}")
                 train_df = grid[grid['d_num'] <= SPLIT_DAY].copy()
-                
                 seq_len = 60
-                if len(train_df) < seq_len * 2:
-                    st.error("Insufficient historical data to train the Transformer sequence windows.")
-                    status.update(label="Failed.", state="error")
-                    return
                 
-                X_cont, X_cat, X_freq, y, scalers, cat_cards, cat_cols = prepare_tfc_tensors(train_df, seq_len=seq_len)
+                X_cont, X_cat, X_freq, y, scalers, cat_cards, cat_cols = prepare_global_tfc_tensors(train_df, seq_len=seq_len)
                 
                 log_placeholder = st.empty()
                 pbar = st.progress(0, text="Initializing Weights...")
                 
-                model, head, val_mse = train_tfc_model(
-                    X_cont, X_cat, X_freq, y, cat_cards, 
-                    log_placeholder, pbar, 
-                    epochs_pre=epochs_pre, epochs_fine=epochs_fine
+                model, head, val_mse = train_global_tfc_model(
+                    X_cont, X_cat, X_freq, y, cat_cards, log_placeholder, pbar, epochs_pre, epochs_fine
                 )
                 
-                rmse = np.sqrt(val_mse) * scalers['sales'].scale_[0] 
+                base_rmse = np.sqrt(val_mse) * scalers['sales'].scale_[0]
+                for item in selected_items: master_metrics['item_rmses'][item] = base_rmse 
                 
-                st.write("🔮 Generating Autoregressive Sequence Forecast...")
-                forecast_grid = recursive_predict_tfc(model, head, grid.copy(), scalers, cat_cols, 1914, seq_len=seq_len)
-                final_features = ["Time Domain Tensors (w/ Positional Encoding)", "Frequency Domain FFT Tensors", "Cross-Domain Contrastive Embedded Space"]
+                st.write("4. 🔮 Executing Vectorized Future Simulation...")
+                forecast_grid = recursive_predict_global_tfc(model, head, grid.copy(), scalers, cat_cols, selected_items, SPLIT_DAY + 1, forecast_horizon, seq_len)
                 pbar.empty()
 
+            # --- Gradient Boosting Execution Path ---
             else:
-                st.write("🔧 Engineering temporal features (Lags, Rolling Windows)...")
-                grid_feat = create_features(grid).dropna(subset=['lag_28', 'rolling_mean_28', 'sales'])
+                st.write("2. 🧮 Engineering Tree Features & Freezing Mathematical Dtypes...")
+                grid_feat_train = grid.dropna(subset=['lag_28', 'rolling_mean_28', 'sales']).copy()
                 exclude_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 'sales', 'd', 'date', 'wm_yr_wk', 'd_num']
-                features = [c for c in grid_feat.columns if c not in exclude_cols]
+                features = [c for c in grid_feat_train.columns if c not in exclude_cols]
                 
-                train_mask = grid_feat['d_num'] <= SPLIT_DAY - 28
-                val_mask = (grid_feat['d_num'] > SPLIT_DAY - 28) & (grid_feat['d_num'] <= SPLIT_DAY)
-                X_train, y_train = grid_feat[train_mask][features], grid_feat[train_mask]['sales']
-                X_val, y_val = grid_feat[val_mask][features], grid_feat[val_mask]['sales']
+                # --- The Protocol of Mizan: Enforcing Absolute Global Categorical Dtypes ---
+                cat_features = ['item_id_encoded', 'event_name_1', 'dayofweek', 'is_weekend', 'month', 'dayofmonth']
+                global_cat_dtypes = {}
                 
-                st.write(f"🧠 Training {selected_model} (Tweedie Loss Optimization)...")
+                for c in cat_features:
+                    if c in grid_feat_train.columns:
+                        grid_feat_train[c] = grid_feat_train[c].astype('category')
+                        global_cat_dtypes[c] = grid_feat_train[c].dtype # Freeze the schema!
+
+                train_mask = grid_feat_train['d_num'] <= SPLIT_DAY - 28
+                val_mask = (grid_feat_train['d_num'] > SPLIT_DAY - 28) & (grid_feat_train['d_num'] <= SPLIT_DAY)
+                X_train, y_train = grid_feat_train[train_mask][features], grid_feat_train[train_mask]['sales']
+                X_val, y_val = grid_feat_train[val_mask][features], grid_feat_train[val_mask]['sales']
+                
+                st.write(f"3. 🧠 Training Single Global Model ({selected_model})...")
                 if selected_model == "LightGBM":
-                    model = train_lightgbm(X_train, y_train, X_val, y_val)
+                    model = train_lightgbm_global(X_train, y_train, X_val, y_val, learning_rate, iterations)
                     val_preds = model.predict(X_val)
                 elif selected_model == "XGBoost":
-                    model = train_xgboost(X_train, y_train, X_val, y_val)
+                    model = train_xgboost_global(X_train, y_train, X_val, y_val, learning_rate, iterations)
                     val_preds = model.predict(xgb.DMatrix(X_val, enable_categorical=True))
                 elif selected_model == "CatBoost":
-                    model = train_catboost(X_train, y_train, X_val, y_val, features)
+                    valid_cats = [c for c in cat_features if c in features]
+                    cat_indices = [features.index(c) for c in valid_cats]
+                    train_pool = Pool(X_train, y_train, cat_features=cat_indices)
+                    val_pool = Pool(X_val, y_val, cat_features=cat_indices)
+                    model = CatBoostRegressor(iterations=iterations, learning_rate=learning_rate, depth=6, loss_function='Tweedie:variance_power=1.1', verbose=0, l2_leaf_reg=5)
+                    model.fit(train_pool, eval_set=val_pool)
                     val_preds = model.predict(X_val)
-                
-                rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-                st.write("🔮 Generating Recursive Forecast (28 Days Horizon)...")
-                forecast_grid, final_features = recursive_predict(model, grid.copy(), 1914, selected_model)
+
+                X_val_df = grid_feat_train[val_mask].copy()
+                X_val_df['val_preds'] = val_preds
+                for item in selected_items:
+                    item_val = X_val_df[X_val_df['item_id'] == item]
+                    rmse = np.sqrt(mean_squared_error(item_val['sales'], item_val['val_preds'])) if not item_val.empty else 0.5
+                    master_metrics['item_rmses'][item] = rmse
+
+                st.write("4. 🔮 Executing Vectorized Future Simulation...")
+                forecast_grid, _ = recursive_predict_global_trees(model, grid.copy(), SPLIT_DAY + 1, forecast_horizon, selected_model, global_cat_dtypes)
             
-            status.update(label="Analysis Complete!", state="complete", expanded=False)
+            st.write("5. 🚚 Extrapolating Inventory Plans...")
+            portfolio_plans = []
+            for item in selected_items:
+                rmse = master_metrics['item_rmses'][item]
+                item_plan = calculate_inventory_plan(forecast_grid, SPLIT_DAY + 1, forecast_horizon, rmse, lead_time, z_score, current_stock, item)
+                portfolio_plans.append(item_plan)
+                
+                st.session_state['portfolio_details'][item] = {
+                    'history_grid': data[(data['d_num'] <= SPLIT_DAY) & (data['item_id'] == item)],
+                    'ground_truth': data[(data['d_num'] > SPLIT_DAY) & (data['d_num'] <= SPLIT_DAY + forecast_horizon) & (data['item_id'] == item)],
+                    'plan': item_plan,
+                    'rmse': rmse
+                }
+                
+                avg_price = item_plan['sell_price'].mean() if 'sell_price' in item_plan.columns else 0
+                master_metrics['total_demand'] += item_plan['sales'].sum()
+                master_metrics['capital_tied'] += (item_plan['safety_stock'].mean() * avg_price)
 
-        # --- Dashboard ---
-        st.markdown("### 📊 Executive Summary")
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        
-        plan = calculate_inventory_plan(forecast_grid, 1914, rmse, lead_time, z_score, current_stock)
-        total_demand = plan['sales'].sum()
-        next_order = plan[plan['recommended_order'] > 0]
-        next_order_day = next_order['date'].dt.strftime('%Y-%m-%d').iloc[0] if not next_order.empty else "None"
-        
-        kpi1.metric("Model Confidence (RMSE)", f"{rmse:.2f}", delta_color="inverse")
-        kpi2.metric("28-Day Demand Forecast", f"{int(total_demand)} units")
-        kpi3.metric("Safety Stock Buffer", f"{int(plan['safety_stock'].mean())} units")
-        kpi4.metric("Next Replenishment", next_order_day)
+            st.session_state['master_df'] = pd.concat(portfolio_plans, ignore_index=True)
+            st.session_state['avg_rmse'] = np.mean(list(master_metrics['item_rmses'].values()))
+            st.session_state['total_demand'] = master_metrics['total_demand']
+            st.session_state['capital_tied'] = master_metrics['capital_tied']
+            
+            status.update(label=f"✅ Unified AI Processed {len(selected_items)} Nodes Matrix.", state="complete", expanded=False)
 
-        # --- Tabs ---
-        tab1, tab2, tab3 = st.tabs(["📈 Lifecycle & Forecast", "🚚 Inventory Action Plan", "🔍 Model Diagnostics"])
+    if 'portfolio_details' in st.session_state and st.session_state['portfolio_details']:
+        st.markdown("### 🌐 Global Category Executive Summary")
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("Average Category RMSE", f"{st.session_state['avg_rmse']:.2f}")
+        kpi2.metric("Total Category Demand", f"{int(st.session_state['total_demand'])} units")
+        kpi3.metric("Total Capital Tied in Safety Stock", f"${int(st.session_state['capital_tied'])}")
+
+        st.markdown("---")
+        tab1, tab2 = st.tabs(["📊 Unified Analytics Console", "🗂️ Master Schedule Export"])
         
         with tab1:
-            st.plotly_chart(plot_interactive_lifecycle(grid, plan, selected_item, rmse), use_container_width=True)
+            st.plotly_chart(plot_portfolio_comparison(st.session_state['portfolio_details']), use_container_width=True)
+            st.markdown("---")
+            st.markdown("#### 🔬 Dynamic SKU Inspection")
+            inspect_item = st.selectbox("Select specific node for granular analysis:", list(st.session_state['portfolio_details'].keys()))
             
+            if inspect_item:
+                details = st.session_state['portfolio_details'][inspect_item]
+                st.plotly_chart(plot_interactive_lifecycle(details['history_grid'], details['plan'], details['ground_truth'], inspect_item, details['rmse']), use_container_width=True)
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.plotly_chart(plot_interactive_action_plan(details['plan'], inspect_item), use_container_width=True)
         with tab2:
-            st.plotly_chart(plot_interactive_action_plan(plan, selected_item), use_container_width=True)
-            st.markdown("#### 📋 Detailed Replenishment Schedule")
-            cols = ['sales', 'safety_stock', 'projected_inventory', 'recommended_order']
-            disp = plan[['date'] + cols].head(14).copy()
-            disp['date'] = disp['date'].dt.strftime('%Y-%m-%d')
-            st.dataframe(disp.style.background_gradient(cmap='Reds', subset=['recommended_order']).format({c: "{:.1f}" for c in cols}), use_container_width=True)
+            st.markdown("#### 💾 Master Replenishment Plan")
+            export_df = st.session_state['master_df'][['date', 'item_id', 'sales', 'safety_stock', 'projected_inventory', 'recommended_order']].copy()
+            export_df['date'] = export_df['date'].dt.strftime('%Y-%m-%d')
+            actionable_orders = export_df[export_df['recommended_order'] > 0].sort_values(by=['date', 'item_id'])
             
-        with tab3:
-            if selected_model in ["Prophet", "TF-C (Transformer)"]:
-                st.info(f"**{selected_model}** utilizes complex internal mechanisms (Bayesian curves / Neural Embeddings). Standard tree-based Feature Importance mapping is not natively applicable.")
-                if selected_model == "TF-C (Transformer)":
-                    st.markdown("**TF-C Architecture:** Relies on cross-referencing temporal autoregression (Time-Domain) with signal harmonics (Frequency-Domain FFT) using Contrastive Learning. Sequence structure mapped via Positional Encoding.")
-            else:
-                st.plotly_chart(plot_feature_importance(model, final_features, selected_model), use_container_width=True)
-                st.info("Feature Importance shows which variables (Lags, Trends, Price) most influenced the AI's decision.")
+            st.download_button("📥 Download Global ERP Matrix (CSV)", data=export_df.to_csv(index=False).encode('utf-8'), file_name='global_portfolio_plan.csv', mime='text/csv', type="primary")
+            st.dataframe(actionable_orders.style.background_gradient(cmap='Greens', subset=['recommended_order']).format(precision=1), use_container_width=True)
 
 if __name__ == "__main__":
     main()
